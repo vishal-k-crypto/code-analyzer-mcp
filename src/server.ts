@@ -3,8 +3,8 @@
  * Configures and starts the MCP server
  */
 
-import { McpServer } from '@modelcontextprotocol/server';
-import { StdioServerTransport } from '@modelcontextprotocol/server/stdio.js';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { Orchestrator } from './core/orchestrator.js';
 import { registerTools, registerResources, registerPrompts } from './mcp/index.js';
 import { isLLMAvailable, getLLMConfig } from './utils/config.js';
@@ -49,7 +49,7 @@ export async function startServer(config: ServerConfig): Promise<void> {
   logger.info('Orchestrator initialized');
 
   // Create MCP server
-  const server = new McpServer(
+  const server = new Server(
     {
       name: 'orchestrator-mcp-server',
       version: '1.0.0',

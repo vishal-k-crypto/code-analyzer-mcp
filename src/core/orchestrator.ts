@@ -353,6 +353,10 @@ export class Orchestrator {
       };
 
       this.state.errorLog.entries.push(error);
+      
+      // Analyze and update error patterns
+      this.analyzeErrorPatterns(error);
+      
       this.transitionState({ type: 'TASK_FAILED', taskId, error });
     }
 
@@ -504,6 +508,254 @@ export class Orchestrator {
    */
   async restoreCheckpoint(checkpointId: string): Promise<void> {
     this.state = await this.stateManager.restoreCheckpoint(checkpointId);
+  }
+
+  /**
+   * Verify project without submitting a task
+   * Runs tsc --noEmit, npm test, and eslint
+   */
+  async verifyProject(verbose?: boolean): Promise<{ success: boolean; output: string }> {
+    await this.ensureInitialized();
+
+    const results: string[] = [];
+    let allPassed = true;
+
+    // Determine project type and run appropriate verification commands
+    const projectType = await this.detectProjectType();
+    const verificationCommands = this.getVerificationCommands(projectType);
+
+    for (const cmd of verificationCommands) {
+      const [command, ...args] = cmd.split(' ');
+      const result = await this.executionSandbox.execute(command, args);
+
+      if (verbose) {
+        results.push(`$ ${cmd}`);
+        results.push(result.success ? '✓ PASSED' : '✗ FAILED');
+        if (result.stdout) results.push(result.stdout);
+        if (result.stderr) results.push(result.stderr);
+        results.push('');
+      } else {
+        results.push(`${result.success ? '✓' : '✗'} ${cmd}`);
+      }
+
+      if (!result.success) {
+        allPassed = false;
+      }
+    }
+
+    return {
+      success: allPassed,
+      output: results.join('\n')
+    };
+  }
+
+  /**
+   * Detect project type to determine verification commands
+   */
+  private async detectProjectType(): Promise<'typescript' | 'python' | 'rust' | 'go' | 'unknown'> {
+    const { promises: fs } = await import('fs');
+    
+    try {
+      const files = await fs.readdir(this.config.projectPath);
+      
+      if (files.includes('package.json')) return 'typescript';
+      if (files.includes('Cargo.toml')) return 'rust';
+      if (files.includes('go.mod')) return 'go';
+      if (files.includes('requirements.txt') || files.includes('pyproject.toml') || files.includes('setup.py')) {
+        return 'python';
+      }
+      
+      return 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  /**
+   * Get verification commands based on project type
+   */
+  private getVerificationCommands(projectType: string): string[] {
+    const commands: string[] = [];
+    
+    switch (projectType) {
+      case 'typescript':
+        commands.push('npx tsc --noEmit');
+        commands.push('npm test');
+        commands.push('npx eslint .');
+        break;
+      case 'python':
+        commands.push('python -m pytest');
+        commands.push('python -m flake8 .');
+        break;
+      case 'rust':
+        commands.push('cargo check');
+        commands.push('cargo test');
+        commands.push('cargo clippy');
+        break;
+      case 'go':
+        commands.push('go build ./...');
+        commands.push('go test ./...');
+        commands.push('go vet ./...');
+        break;
+      default:
+        // Generic fallback
+        commands.push('echo "No standard verification commands for this project type"');
+    }
+    
+    return commands;
+  }
+
+  /**
+   * Analyze error patterns and update error log
+   * Detects recurring errors and suggests fixes
+   */
+  private analyzeErrorPatterns(newError: ErrorEntry): void {
+    const patterns = this.state.errorLog.patterns;
+    
+    // Categorize the error
+    const errorCategory = this.categorizeError(newError);
+    
+    // Find existing pattern
+    const existingPattern = patterns.find(p => p.pattern === errorCategory);
+    
+    if (existingPattern) {
+      // Update existing pattern
+      existingPattern.frequency++;
+      if (!existingPattern.affectedTasks.includes(newError.taskId)) {
+        existingPattern.affectedTasks.push(newError.taskId);
+      }
+    } else {
+      // Create new pattern
+      patterns.push({
+        pattern: errorCategory,
+        frequency: 1,
+        affectedTasks: [newError.taskId],
+        suggestions: this.generateErrorSuggestions(errorCategory, newError)
+      });
+    }
+    
+    // Keep only top patterns to prevent unbounded growth
+    if (patterns.length > 50) {
+      // Sort by frequency and keep top 50
+      patterns.sort((a, b) => b.frequency - a.frequency);
+      patterns.length = 50;
+    }
+  }
+
+  /**
+   * Categorize an error into a pattern type
+   */
+  private categorizeError(error: ErrorEntry): string {
+    const message = error.message.toLowerCase();
+    const file = error.file?.toLowerCase() || '';
+    
+    // Type-related errors
+    if (message.includes('type') && (message.includes('assignable') || message.includes('not assignable'))) {
+      return 'type-mismatch';
+    }
+    if (message.includes('cannot find') || message.includes('not found')) {
+      if (message.includes('module')) return 'missing-module';
+      if (message.includes('name')) return 'missing-variable';
+      return 'missing-reference';
+    }
+    if (message.includes('syntax') || message.includes('unexpected token')) {
+      return 'syntax-error';
+    }
+    if (message.includes('timeout') || message.includes('timed out')) {
+      return 'timeout';
+    }
+    if (message.includes('import') || message.includes('require')) {
+      return 'import-error';
+    }
+    if (message.includes('test') && (message.includes('fail') || message.includes('assertion'))) {
+      return 'test-failure';
+    }
+    if (file.includes('.test.') || file.includes('.spec.')) {
+      return 'test-file-error';
+    }
+    if (message.includes('lint') || message.includes('eslint')) {
+      return 'lint-error';
+    }
+    if (message.includes('permission') || message.includes('access')) {
+      return 'permission-error';
+    }
+    if (message.includes('memory') || message.includes('heap')) {
+      return 'memory-error';
+    }
+    
+    return 'unknown-error';
+  }
+
+  /**
+   * Generate suggestions for an error pattern
+   */
+  private generateErrorSuggestions(pattern: string, _error: ErrorEntry): string[] {
+    const suggestions: Record<string, string[]> = {
+      'type-mismatch': [
+        'Check that types match between assignment and declaration',
+        'Verify interface/type definitions are correct',
+        'Consider using type assertions if needed',
+        'Run \'npx tsc --noEmit\' to see full type errors'
+      ],
+      'missing-module': [
+        'Run \'npm install\' to install missing dependencies',
+        'Check package.json for the correct package name',
+        'Verify the import path is correct'
+      ],
+      'missing-variable': [
+        'Check for typos in variable names',
+        'Ensure the variable is declared before use',
+        'Verify the variable is in scope'
+      ],
+      'syntax-error': [
+        'Check for missing brackets, parentheses, or quotes',
+        'Verify correct use of semicolons',
+        'Look for invalid characters in the code'
+      ],
+      'timeout': [
+        'Increase timeout limit if test is legitimate',
+        'Check for infinite loops in the code',
+        'Verify async operations are properly awaited'
+      ],
+      'import-error': [
+        'Check that the imported file exists',
+        'Verify the import path is correct',
+        'Ensure the module exports the expected items'
+      ],
+      'test-failure': [
+        'Run tests individually to isolate the failing test',
+        'Check test assertions match expected behavior',
+        'Verify test setup and teardown are correct'
+      ],
+      'lint-error': [
+        'Run \'npx eslint --fix\' to auto-fix linting issues',
+        'Check .eslintrc for configured rules',
+        'Follow project coding style guidelines'
+      ],
+      'permission-error': [
+        'Check file permissions',
+        'Ensure the process has access to required directories',
+        'Run with appropriate privileges'
+      ],
+      'memory-error': [
+        'Check for memory leaks in the code',
+        'Optimize data structures to use less memory',
+        'Consider streaming for large data processing'
+      ]
+    };
+    
+    return suggestions[pattern] || [
+      'Review the error message carefully',
+      'Check the file and line number indicated',
+      'Search for similar issues in the codebase'
+    ];
+  }
+
+  /**
+   * Get error patterns for analysis
+   */
+  getErrorPatterns(): import('../types/state.js').ErrorPattern[] {
+    return this.state.errorLog.patterns;
   }
 
   /**

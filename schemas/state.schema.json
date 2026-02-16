@@ -1,0 +1,97 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://orchestrator-mcp-server/schemas/state.schema.json",
+  "title": "Orchestrator State",
+  "description": "State schema for the Orchestrator MCP Server",
+  "type": "object",
+  "required": ["projectGoal", "progress", "taskQueue", "errorLog", "projectPath"],
+  "properties": {
+    "projectGoal": {
+      "oneOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "required": ["id", "description", "requirements", "constraints", "targetMetrics", "createdAt", "updatedAt"],
+          "properties": {
+            "id": { "type": "string" },
+            "description": { "type": "string" },
+            "requirements": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id", "description", "type", "priority", "components", "acceptanceCriteria", "dependencies", "weight", "verified", "partiallyMet"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "description": { "type": "string" },
+                  "type": { "enum": ["feature", "bugfix", "refactor", "test"] },
+                  "priority": { "enum": ["critical", "high", "medium", "low"] },
+                  "components": { "type": "array", "items": { "type": "string" } },
+                  "acceptanceCriteria": { "type": "array", "items": { "type": "string" } },
+                  "dependencies": { "type": "array", "items": { "type": "string" } },
+                  "weight": { "type": "number" },
+                  "verified": { "type": "boolean" },
+                  "partiallyMet": { "type": "boolean" }
+                }
+              }
+            },
+            "constraints": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id", "description", "type"],
+                "properties": {
+                  "id": { "type": "string" },
+                  "description": { "type": "string" },
+                  "type": { "enum": ["technical", "business", "legal"] }
+                }
+              }
+            },
+            "targetMetrics": {
+              "type": "object",
+              "required": ["qualityThreshold", "maxIterations", "timeoutMinutes"],
+              "properties": {
+                "qualityThreshold": { "type": "number" },
+                "maxIterations": { "type": "number" },
+                "timeoutMinutes": { "type": "number" }
+              }
+            },
+            "createdAt": { "type": "string", "format": "date-time" },
+            "updatedAt": { "type": "string", "format": "date-time" }
+          }
+        }
+      ]
+    },
+    "progress": {
+      "type": "object",
+      "required": ["currentState", "completedTasks", "currentTask", "completionScore", "lastVerifiedAt"],
+      "properties": {
+        "currentState": { "enum": ["IDLE", "ANALYZE_GAPS", "PLAN_ROADMAP", "EXECUTE_SESSION", "VERIFY_OUTPUT", "SCORE_PROJECT", "COMPLETE"] },
+        "completedTasks": { "type": "array" },
+        "currentTask": { "oneOf": [{ "type": "null" }, { "type": "object" }] },
+        "completionScore": { "type": "number" },
+        "lastVerifiedAt": { "oneOf": [{ "type": "null" }, { "type": "string", "format": "date-time" }] }
+      }
+    },
+    "taskQueue": {
+      "type": "object",
+      "required": ["phases", "pending", "inProgress", "failed", "dependencies"],
+      "properties": {
+        "phases": { "type": "array" },
+        "pending": { "type": "array" },
+        "inProgress": { "oneOf": [{ "type": "null" }, { "type": "object" }] },
+        "failed": { "type": "array" },
+        "dependencies": { "type": "object" }
+      }
+    },
+    "errorLog": {
+      "type": "object",
+      "required": ["entries", "patterns", "retryCount"],
+      "properties": {
+        "entries": { "type": "array" },
+        "patterns": { "type": "array" },
+        "retryCount": { "type": "object" }
+      }
+    },
+    "projectPath": { "type": "string" }
+  }
+}

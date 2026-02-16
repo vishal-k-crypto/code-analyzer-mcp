@@ -5,6 +5,14 @@
 
 export { ContextAssembler } from './assembler.js';
 export { 
+  FileScorer, 
+  quickRelevanceScore, 
+  extractFileReferences,
+  DEFAULT_SIGNALS,
+  type ScoringSignals,
+  type ScoringOptions
+} from './file-scorer.js';
+export { 
   generateBoundedContextPrompt, 
   generateErrorFixPrompt, 
   generateNextTargetGuide 

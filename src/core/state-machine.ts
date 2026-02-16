@@ -3,7 +3,7 @@
  * Implements the orchestration state machine
  */
 
-import type { State, OrchestratorState, Task, ErrorEntry } from '../types/state.js';
+import type { State, Task, ErrorEntry } from '../types/state.js';
 import { QUALITY_THRESHOLD } from '../types/state.js';
 
 export type StateTransition = 
@@ -85,8 +85,9 @@ export class StateMachine {
           if (transition.score >= QUALITY_THRESHOLD) {
             return 'COMPLETE';
           }
-          // Need more work - check if there are pending tasks
-          return 'EXECUTE_SESSION';
+          // Need more work - re-analyze gaps to identify what still needs to be done
+          // This loops back per spec diagram (line 93: iterate back to gaps)
+          return 'ANALYZE_GAPS';
         }
         if (transition.type === 'RESET') {
           return 'IDLE';

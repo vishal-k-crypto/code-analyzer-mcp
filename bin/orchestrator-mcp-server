@@ -1,0 +1,59 @@
+#!/usr/bin/env node
+/**
+ * Orchestrator MCP Server CLI Entry Point
+ */
+
+import { startServer } from '../dist/server.js';
+import { resolve } from 'path';
+
+const args = process.argv.slice(2);
+
+// Parse arguments
+let projectPath = process.cwd();
+let qualityThreshold = 85;
+let logLevel = 'info';
+
+for (let i = 0; i < args.length; i++) {
+  const arg = args[i];
+  
+  if (arg === '--project-path' || arg === '-p') {
+    projectPath = resolve(args[++i]);
+  } else if (arg === '--quality-threshold' || arg === '-q') {
+    qualityThreshold = parseInt(args[++i], 10);
+  } else if (arg === '--log-level' || arg === '-l') {
+    logLevel = args[++i];
+  } else if (arg === '--help' || arg === '-h') {
+    console.log(`
+Orchestrator MCP Server - AI Coding Assistant Orchestrator
+
+Usage: orchestrator-mcp-server [options]
+
+Options:
+  -p, --project-path <path>      Project path (default: current directory)
+  -q, --quality-threshold <n>    Quality threshold 0-100 (default: 85)
+  -l, --log-level <level>        Log level: debug, info, warn, error (default: info)
+  -h, --help                     Show this help
+
+Environment Variables:
+  OPENAI_API_KEY                 OpenAI API key for LLM parsing
+  ANTHROPIC_API_KEY              Anthropic API key for LLM parsing
+  LLM_API_KEY + LLM_BASE_URL     Custom LLM provider
+
+Examples:
+  orchestrator-mcp-server
+  orchestrator-mcp-server -p /path/to/project -q 90
+  orchestrator-mcp-server --log-level debug
+`);
+    process.exit(0);
+  }
+}
+
+// Start the server
+startServer({
+  projectPath,
+  qualityThreshold,
+  logLevel
+}).catch((error) => {
+  console.error('Failed to start server:', error);
+  process.exit(1);
+});

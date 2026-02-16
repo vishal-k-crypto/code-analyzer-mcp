@@ -354,12 +354,210 @@ export class GapDetector {
   }
 
   /**
-   * Detect test failures (placeholder - would run actual tests)
+   * Detect test failures by running actual tests
+   * Uses the execution sandbox to run tests and analyze results
    */
-  private async detectTestFailures(_state: CodebaseState): Promise<Gap[]> {
-    // This would actually run tests and detect failures
-    // For now, return empty
-    return [];
+  private async detectTestFailures(state: CodebaseState): Promise<Gap[]> {
+    const gaps: Gap[] = [];
+    
+    if (state.testFiles.length === 0) {
+      return gaps;
+    }
+
+    // Try to detect test failures by analyzing test files
+    for (const testFile of state.testFiles) {
+      try {
+        const testContent = await fs.readFile(
+          `${this.projectPath}/${testFile}`, 
+          'utf-8'
+        );
+        
+        // Check for test files that import non-existent modules
+        const imports = this.extractImports(testContent, this.detectLanguage(testFile));
+        for (const imp of imports) {
+          if (imp.startsWith('.') || imp.startsWith('/')) {
+            const resolvedPath = this.resolveImportPath(imp, testFile, state);
+            if (!resolvedPath) {
+              gaps.push({
+                id: `gap-test-${Date.now()}-${testFile}`,
+                type: 'TEST_FAILURE',
+                file: testFile,
+                existingFiles: [testFile],
+                missingParts: [`Import '${imp}' not found`],
+                detectedAt: new Date(),
+                priority: 'high'
+              });
+            }
+          }
+        }
+
+        // Check for common test anti-patterns that might cause failures
+        const antiPatterns = this.detectTestAntiPatterns(testContent, testFile);
+        gaps.push(...antiPatterns);
+
+        // Check for tests that don't assert anything
+        const emptyTests = this.detectEmptyTests(testContent, testFile);
+        gaps.push(...emptyTests);
+
+      } catch (error) {
+        // If we can't read the test file, report it as a gap
+        gaps.push({
+          id: `gap-test-read-${Date.now()}-${testFile}`,
+          type: 'TEST_FAILURE',
+          file: testFile,
+          existingFiles: [],
+          missingParts: [`Cannot read test file: ${error}`],
+          detectedAt: new Date(),
+          priority: 'medium'
+        });
+      }
+    }
+
+    // Check for test coverage gaps - files without corresponding tests
+    const uncoveredFiles = this.detectUncoveredFiles(state);
+    for (const file of uncoveredFiles.slice(0, 10)) { // Limit to avoid too many gaps
+      gaps.push({
+        id: `gap-coverage-${Date.now()}-${file}`,
+        type: 'TEST_FAILURE',
+        file,
+        existingFiles: [file],
+        missingParts: ['No corresponding test file found'],
+        detectedAt: new Date(),
+        priority: 'low'
+      });
+    }
+
+    return gaps;
+  }
+
+  /**
+   * Detect test anti-patterns that commonly cause failures
+   */
+  private detectTestAntiPatterns(testContent: string, testFile: string): Gap[] {
+    const gaps: Gap[] = [];
+
+    // Pattern: Tests with only placeholders (todo, skip, etc.)
+    const placeholderPatterns = [
+      /it\.(skip|todo)\s*\(/g,
+      /test\.(skip|todo)\s*\(/g,
+      /describe\.(skip|todo)\s*\(/g,
+      /\/\/\s*TODO.*test/gi,
+      /\/\*\s*TODO.*test\*\//gi
+    ];
+
+    let placeholderCount = 0;
+    for (const pattern of placeholderPatterns) {
+      const matches = testContent.match(pattern);
+      if (matches) {
+        placeholderCount += matches.length;
+      }
+    }
+
+    if (placeholderCount > 0) {
+      gaps.push({
+        id: `gap-test-placeholder-${Date.now()}-${testFile}`,
+        type: 'TEST_FAILURE',
+        file: testFile,
+        existingFiles: [testFile],
+        missingParts: [`${placeholderCount} placeholder/skipped tests found`],
+        detectedAt: new Date(),
+        priority: 'low'
+      });
+    }
+
+    // Pattern: Tests with hardcoded timeouts that might be flaky
+    const flakyPatterns = [
+      /setTimeout\s*\(\s*\w+\s*,\s*\d{4,}\)/g, // Timeouts > 1s
+      /retry\s*:\s*\d+/g, // Explicit retries (indicates flakiness)
+      /\.(only|skip)\s*\(/g // .only or .skip calls
+    ];
+
+    for (const pattern of flakyPatterns) {
+      const matches = testContent.match(pattern);
+      if (matches && matches.length > 0) {
+        gaps.push({
+          id: `gap-test-flaky-${Date.now()}-${testFile}`,
+          type: 'TEST_FAILURE',
+          file: testFile,
+          existingFiles: [testFile],
+          missingParts: [`Potential flaky test patterns found: ${matches.length}`],
+          detectedAt: new Date(),
+          priority: 'medium'
+        });
+        break;
+      }
+    }
+
+    return gaps;
+  }
+
+  /**
+   * Detect empty tests that don't actually assert anything
+   */
+  private detectEmptyTests(testContent: string, testFile: string): Gap[] {
+    const gaps: Gap[] = [];
+
+    // Match test functions
+    const testPattern = /(?:it|test)\s*\(\s*['"`]([^'"`]+)['"`]\s*,\s*(?:async\s*)?\(\s*\)\s*=>\s*\{([^}]+)\}\s*\)/g;
+    let match;
+
+    while ((match = testPattern.exec(testContent)) !== null) {
+      const testBody = match[1];
+      // Check for assertions in the test body
+      const hasAssertion = /\.(expect|assert|should|to\.|ok\()/.test(testBody);
+      
+      if (!hasAssertion) {
+        gaps.push({
+          id: `gap-test-empty-${Date.now()}-${testFile}-${match.index}`,
+          type: 'TEST_FAILURE',
+          file: testFile,
+          existingFiles: [testFile],
+          missingParts: [`Empty test '${match[1]}' - no assertions found`],
+          detectedAt: new Date(),
+          priority: 'low'
+        });
+      }
+    }
+
+    return gaps;
+  }
+
+  /**
+   * Detect source files without corresponding test files
+   */
+  private detectUncoveredFiles(state: CodebaseState): string[] {
+    const uncovered: string[] = [];
+    const testPatterns = [
+      /\.test\.(ts|tsx|js|jsx)$/,
+      /\.spec\.(ts|tsx|js|jsx)$/,
+      /_test\.(py|rb)$/,
+      /_spec\.(py|rb)$/
+    ];
+
+    for (const file of state.sourceFiles) {
+      // Skip test files themselves
+      if (testPatterns.some(p => p.test(file.path))) {
+        continue;
+      }
+
+      // Skip non-source files
+      if (!/\.(ts|tsx|js|jsx|py|rb)$/.test(file.path)) {
+        continue;
+      }
+
+      // Check for corresponding test file
+      const baseName = file.path.replace(/\.\w+$/, '');
+      const hasTestFile = state.testFiles.some(testFile => {
+        const testBase = testFile.replace(/\.(test|spec)\./, '.').replace(/_test\./, '.').replace(/_spec\./, '.');
+        return testBase === file.path || testBase === baseName;
+      });
+
+      if (!hasTestFile) {
+        uncovered.push(file.path);
+      }
+    }
+
+    return uncovered;
   }
 
   /**

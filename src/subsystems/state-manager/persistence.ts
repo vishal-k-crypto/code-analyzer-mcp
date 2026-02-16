@@ -1,32 +1,38 @@
 /**
  * State Persistence Module
  * Handles file-based state persistence with atomic writes and journaling
+ * 
+ * This module delegates journaling and recovery to separate specialized modules:
+ * - journal.ts: Write-ahead logging
+ * - recovery.ts: Crash recovery mechanisms
  */
 
 import { promises as fs, existsSync, mkdirSync } from 'fs';
-import { join, dirname } from 'path';
-import stableStringify from 'fast-json-stable-stringify';
-import type { OrchestratorState, State, Task, ErrorEntry } from '../../types/state.js';
+import { join } from 'path';
+import type { OrchestratorState } from '../../types/state.js';
+import { StateJournal } from './journal.js';
+import { StateRecovery, createDefaultState } from './recovery.js';
 
-export interface JournalEntry {
-  timestamp: string;
-  operation: 'write' | 'checkpoint' | 'restore';
-  stateHash: string;
-  previousHash?: string;
-}
+export { StateJournal, JournalEntry, JournalOperation, JournalMetadata } from './journal.js';
+export { StateRecovery, RecoveryResult, CheckpointInfo, createDefaultState } from './recovery.js';
 
 export class StatePersistence {
   private basePath: string;
   private statePath: string;
-  private journalPath: string;
   private snapshotsPath: string;
   private currentState: OrchestratorState | null = null;
+  private journal: StateJournal;
+  private recovery: StateRecovery;
 
-  constructor(projectPath: string) {
+  private projectId: string;
+
+  constructor(projectPath: string, projectId = 'default') {
+    this.projectId = projectId;
     this.basePath = join(projectPath, '.orchestrator');
     this.statePath = join(this.basePath, 'state', 'current.json');
-    this.journalPath = join(this.basePath, 'state', 'journal');
     this.snapshotsPath = join(this.basePath, 'state', 'snapshots');
+    this.journal = new StateJournal(this.basePath);
+    this.recovery = new StateRecovery(this.statePath, this.snapshotsPath, this.journal);
     this.ensureDirectories();
   }
 
@@ -34,7 +40,7 @@ export class StatePersistence {
     const dirs = [
       this.basePath,
       join(this.basePath, 'state'),
-      this.journalPath,
+      join(this.basePath, 'state', 'journal'),
       this.snapshotsPath,
       join(this.basePath, 'tasks', 'completed'),
       join(this.basePath, 'tasks', 'failed'),
@@ -60,17 +66,9 @@ export class StatePersistence {
       : undefined;
 
     // Write to journal first (write-ahead logging)
-    const journalEntry: JournalEntry = {
-      timestamp: new Date().toISOString(),
-      operation: 'write',
-      stateHash,
-      previousHash
-    };
+    await this.journal.writeEntry(stateHash, 'write', previousHash);
 
-    const journalFile = join(this.journalPath, `${Date.now()}.json`);
-    await fs.writeFile(journalFile, JSON.stringify(journalEntry, null, 2), { mode: 0o600 });
-
-    // Write state to temporary file
+    // Write state to temporary file with secure permissions
     const tempPath = `${this.statePath}.tmp`;
     await fs.writeFile(tempPath, serialized, { mode: 0o600 });
 
@@ -81,7 +79,7 @@ export class StatePersistence {
     this.currentState = structuredClone(state);
 
     // Cleanup old journal entries (keep last 50)
-    await this.cleanupOldJournals(50);
+    await this.journal.cleanup(50);
   }
 
   /**
@@ -90,7 +88,7 @@ export class StatePersistence {
   async loadState(): Promise<OrchestratorState> {
     try {
       if (!existsSync(this.statePath)) {
-        return this.createDefaultState();
+        return createDefaultState();
       }
 
       const content = await fs.readFile(this.statePath, 'utf-8');
@@ -99,14 +97,16 @@ export class StatePersistence {
       // Validate loaded state
       if (!this.validateState(state)) {
         console.warn('Invalid state loaded, attempting recovery...');
-        return await this.recoverFromJournal() || this.createDefaultState();
+        const recovery = await this.recovery.recover();
+        return recovery.state || createDefaultState();
       }
 
       this.currentState = structuredClone(state);
       return state;
     } catch (error) {
       console.error('Failed to load state:', error);
-      return await this.recoverFromJournal() || this.createDefaultState();
+      const recovery = await this.recovery.recover();
+      return recovery.state || createDefaultState();
     }
   }
 
@@ -119,20 +119,13 @@ export class StatePersistence {
     }
 
     const checkpointId = name || `checkpoint-${Date.now()}`;
-    const checkpointPath = join(this.snapshotsPath, `${checkpointId}.json`);
+    const checkpointFilePath = join(this.snapshotsPath, `${checkpointId}.json`);
     
     const serialized = this.serializeState(this.currentState);
-    await fs.writeFile(checkpointPath, serialized, { mode: 0o600 });
+    await fs.writeFile(checkpointFilePath, serialized, { mode: 0o600 });
 
     // Journal the checkpoint
-    const journalEntry: JournalEntry = {
-      timestamp: new Date().toISOString(),
-      operation: 'checkpoint',
-      stateHash: this.computeHash(serialized)
-    };
-
-    const journalFile = join(this.journalPath, `checkpoint-${Date.now()}.json`);
-    await fs.writeFile(journalFile, JSON.stringify(journalEntry, null, 2), { mode: 0o600 });
+    await this.journal.writeCheckpointEntry(checkpointId, this.computeHash(serialized));
 
     return checkpointId;
   }
@@ -151,14 +144,7 @@ export class StatePersistence {
     const state = this.deserializeState(content);
 
     // Journal the restore
-    const journalEntry: JournalEntry = {
-      timestamp: new Date().toISOString(),
-      operation: 'restore',
-      stateHash: this.computeHash(content)
-    };
-
-    const journalFile = join(this.journalPath, `restore-${Date.now()}.json`);
-    await fs.writeFile(journalFile, JSON.stringify(journalEntry, null, 2), { mode: 0o600 });
+    await this.journal.writeRestoreEntry(checkpointId, this.computeHash(content));
 
     this.currentState = structuredClone(state);
     return state;
@@ -168,62 +154,33 @@ export class StatePersistence {
    * List available checkpoints
    */
   async listCheckpoints(): Promise<string[]> {
-    try {
-      const files = await fs.readdir(this.snapshotsPath);
-      return files
-        .filter(f => f.endsWith('.json'))
-        .map(f => f.replace('.json', ''));
-    } catch {
-      return [];
-    }
-  }
-
-  /**
-   * Attempt recovery from journal
-   */
-  private async recoverFromJournal(): Promise<OrchestratorState | null> {
-    try {
-      const files = await fs.readdir(this.journalPath);
-      const journalFiles = files
-        .filter(f => f.endsWith('.json'))
-        .sort()
-        .reverse();
-
-      for (const file of journalFiles) {
-        const content = await fs.readFile(join(this.journalPath, file), 'utf-8');
-        const entry: JournalEntry = JSON.parse(content);
-
-        if (entry.operation === 'write' || entry.operation === 'checkpoint') {
-          // Try to find matching checkpoint or current state
-          const checkpointPath = join(this.snapshotsPath, `checkpoint-${entry.timestamp.split('T')[0]}*.json`);
-          // If we have a valid current state, use it
-          if (existsSync(this.statePath)) {
-            const stateContent = await fs.readFile(this.statePath, 'utf-8');
-            if (this.computeHash(stateContent) === entry.stateHash) {
-              return this.deserializeState(stateContent);
-            }
-          }
-        }
-      }
-
-      return null;
-    } catch {
-      return null;
-    }
+    return this.recovery.listCheckpoints().then(checkpoints => 
+      checkpoints.map(c => c.id)
+    );
   }
 
   /**
    * Serialize state to JSON string
+   * Handles Map serialization properly
    */
   private serializeState(state: OrchestratorState): string {
-    return stableStringify(state, { space: 2 });
+    return JSON.stringify(state, (_key, value) => {
+      // Serialize Maps as objects with entries
+      if (value instanceof Map) {
+        return {
+          __type: 'Map',
+          data: Array.from(value.entries())
+        };
+      }
+      return value;
+    }, 2);
   }
 
   /**
    * Deserialize state from JSON string
    */
   private deserializeState(content: string): OrchestratorState {
-    const parsed = JSON.parse(content, (key, value) => {
+    const parsed = JSON.parse(content, (_key, value) => {
       // Revive Date objects
       if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(value)) {
         return new Date(value);
@@ -265,35 +222,6 @@ export class StatePersistence {
   }
 
   /**
-   * Create default empty state
-   */
-  private createDefaultState(): OrchestratorState {
-    return {
-      projectGoal: null,
-      progress: {
-        currentState: 'IDLE' as State,
-        completedTasks: [],
-        currentTask: null,
-        completionScore: 0,
-        lastVerifiedAt: null
-      },
-      taskQueue: {
-        phases: [],
-        pending: [],
-        inProgress: null,
-        failed: [],
-        dependencies: new Map()
-      },
-      errorLog: {
-        entries: [],
-        patterns: [],
-        retryCount: new Map()
-      },
-      projectPath: ''
-    };
-  }
-
-  /**
    * Compute simple hash for state validation
    */
   private computeHash(content: string): string {
@@ -307,23 +235,208 @@ export class StatePersistence {
   }
 
   /**
-   * Cleanup old journal entries
+   * Get the journal instance
    */
-  private async cleanupOldJournals(maxEntries: number): Promise<void> {
-    try {
-      const files = await fs.readdir(this.journalPath);
-      const journalFiles = files
-        .filter(f => f.endsWith('.json'))
-        .sort();
+  getJournal(): StateJournal {
+    return this.journal;
+  }
 
-      if (journalFiles.length > maxEntries) {
-        const toDelete = journalFiles.slice(0, journalFiles.length - maxEntries);
-        for (const file of toDelete) {
-          await fs.unlink(join(this.journalPath, file));
+  /**
+   * Get the recovery instance
+   */
+  getRecovery(): StateRecovery {
+    return this.recovery;
+  }
+
+  /**
+   * Get project-specific directory path
+   */
+  private getProjectDir(): string {
+    return join(this.basePath, 'projects', this.projectId);
+  }
+
+  /**
+   * Save project goal to markdown file
+   * Stores in .orchestrator/projects/{project-id}/goal.md
+   */
+  async saveProjectGoal(state: OrchestratorState): Promise<void> {
+    if (!state.projectGoal) return;
+
+    const projectDir = this.getProjectDir();
+    await fs.mkdir(projectDir, { recursive: true, mode: 0o700 });
+
+    const goalPath = join(projectDir, 'goal.md');
+    const content = this.formatGoalAsMarkdown(state.projectGoal);
+    await fs.writeFile(goalPath, content, { mode: 0o600 });
+  }
+
+  /**
+   * Load project goal from markdown file
+   */
+  async loadProjectGoal(): Promise<string | null> {
+    const goalPath = join(this.getProjectDir(), 'goal.md');
+    try {
+      return await fs.readFile(goalPath, 'utf-8');
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Save gaps analysis to JSON file
+   * Stores in .orchestrator/projects/{project-id}/gaps.json
+   */
+  async saveGapsAnalysis(gaps: Array<{
+    id: string;
+    description: string;
+    severity: 'critical' | 'high' | 'medium' | 'low';
+    category: string;
+  }>): Promise<void> {
+    const projectDir = this.getProjectDir();
+    await fs.mkdir(projectDir, { recursive: true, mode: 0o700 });
+
+    const gapsPath = join(projectDir, 'gaps.json');
+    await fs.writeFile(gapsPath, JSON.stringify({
+      projectId: this.projectId,
+      generatedAt: new Date().toISOString(),
+      gaps
+    }, null, 2), { mode: 0o600 });
+  }
+
+  /**
+   * Load gaps analysis from JSON file
+   */
+  async loadGapsAnalysis(): Promise<unknown | null> {
+    const gapsPath = join(this.getProjectDir(), 'gaps.json');
+    try {
+      const content = await fs.readFile(gapsPath, 'utf-8');
+      return JSON.parse(content);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Save score history to JSON file
+   * Stores in .orchestrator/projects/{project-id}/score-history.json
+   */
+  async saveScoreHistory(scoreHistory: {
+    entries: Array<{
+      timestamp: string;
+      score: number;
+      breakdown: Record<string, number>;
+    }>;
+    trend: 'improving' | 'stable' | 'regressing';
+    velocity: number;
+  }): Promise<void> {
+    const projectDir = this.getProjectDir();
+    await fs.mkdir(projectDir, { recursive: true, mode: 0o700 });
+
+    const historyPath = join(projectDir, 'score-history.json');
+    await fs.writeFile(historyPath, JSON.stringify({
+      projectId: this.projectId,
+      updatedAt: new Date().toISOString(),
+      ...scoreHistory
+    }, null, 2), { mode: 0o600 });
+  }
+
+  /**
+   * Load score history from JSON file
+   */
+  async loadScoreHistory(): Promise<unknown | null> {
+    const historyPath = join(this.getProjectDir(), 'score-history.json');
+    try {
+      const content = await fs.readFile(historyPath, 'utf-8');
+      return JSON.parse(content);
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * List all project IDs with stored data
+   */
+  async listProjects(): Promise<string[]> {
+    const projectsDir = join(this.basePath, 'projects');
+    try {
+      const entries = await fs.readdir(projectsDir, { withFileTypes: true });
+      return entries.filter(e => e.isDirectory()).map(e => e.name);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Format goal as markdown for human-readable storage
+   */
+  private formatGoalAsMarkdown(goal: {
+    id: string;
+    description: string;
+    requirements: Array<{
+      id: string;
+      description: string;
+      type: string;
+      priority: string;
+      acceptanceCriteria: string[];
+    }>;
+    constraints: Array<{
+      id: string;
+      description: string;
+      type: string;
+    }>;
+    targetMetrics: {
+      qualityThreshold: number;
+      maxIterations: number;
+      timeoutMinutes: number;
+    };
+    createdAt: Date;
+    updatedAt: Date;
+  }): string {
+    const lines: string[] = [];
+    
+    lines.push(`# Project Goal`);
+    lines.push('');
+    lines.push(goal.description);
+    lines.push('');
+    lines.push(`**ID:** ${goal.id}`);
+    lines.push(`**Created:** ${goal.createdAt.toISOString()}`);
+    lines.push(`**Updated:** ${goal.updatedAt.toISOString()}`);
+    lines.push('');
+    
+    lines.push('## Target Metrics');
+    lines.push('');
+    lines.push(`- Quality Threshold: ${goal.targetMetrics.qualityThreshold}%`);
+    lines.push(`- Max Iterations: ${goal.targetMetrics.maxIterations}`);
+    lines.push(`- Timeout: ${goal.targetMetrics.timeoutMinutes} minutes`);
+    lines.push('');
+    
+    lines.push('## Requirements');
+    lines.push('');
+    for (const req of goal.requirements) {
+      lines.push(`### ${req.id}`);
+      lines.push('');
+      lines.push(req.description);
+      lines.push('');
+      lines.push(`- **Type:** ${req.type}`);
+      lines.push(`- **Priority:** ${req.priority}`);
+      if (req.acceptanceCriteria.length > 0) {
+        lines.push('- **Acceptance Criteria:**');
+        for (const criteria of req.acceptanceCriteria) {
+          lines.push(`  - ${criteria}`);
         }
       }
-    } catch {
-      // Ignore cleanup errors
+      lines.push('');
     }
+    
+    if (goal.constraints.length > 0) {
+      lines.push('## Constraints');
+      lines.push('');
+      for (const constraint of goal.constraints) {
+        lines.push(`- **${constraint.type}:** ${constraint.description}`);
+      }
+      lines.push('');
+    }
+    
+    return lines.join('\n');
   }
 }

@@ -89,11 +89,19 @@ export interface Task {
   requirementId?: string;
 }
 
+export interface FileReference {
+  path: string;
+  relevance: number;
+}
+
 export interface BoundedContext {
   relevantFiles: string[];
   forbiddenFiles: string[];
   instructions: string;
   expectedOutput: string;
+  essentialFiles?: FileReference[];
+  referenceFiles?: FileReference[];
+  testCommands?: string[];
 }
 
 export interface ErrorLog {
