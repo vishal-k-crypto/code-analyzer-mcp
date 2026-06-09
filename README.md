@@ -27,6 +27,8 @@ Think of it as an AI project manager that:
 
 ---
 
+<a id="features"></a>
+
 ## ✨ Features
 
 | Feature | Description |
@@ -40,6 +42,8 @@ Think of it as an AI project manager that:
 | **Crash Recovery** | Persistent state with journaling and checkpoints |
 
 ---
+
+<a id="quick-start"></a>
 
 ## 🚀 Quick Start
 
@@ -89,6 +93,8 @@ npx orchestrator-mcp-server --threshold 90
 ```
 
 ---
+
+<a id="architecture"></a>
 
 ## 🏗️ Architecture
 
